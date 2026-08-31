@@ -43,50 +43,36 @@ familyRouter.post(
     const familyName = requestedName.slice(0, 80)
     if (!familyName) throw new ApiError(400, 'bad_request', 'Family name is required')
 
-    const context = await withTx(async (client) => {
-      const existing = await client.query<{
-        family_id: string
-        family_name: string
-        role: 'admin' | 'member'
-        status: 'invited' | 'active' | 'disabled'
-      }>(
-        `SELECT fm.family_id, f.name AS family_name, fm.role, fm.status
-           FROM family_member fm JOIN family f ON f.id = fm.family_id
-          WHERE fm.user_id = $1`,
-        [userId],
-      )
-      if (existing.rows[0]) return existing.rows[0]
-
-      const created = await client.query<{ id: string; name: string }>(
-        `INSERT INTO family (name, created_by)
-         VALUES ($1, $2)
-         ON CONFLICT (created_by) DO UPDATE SET name = family.name
-         RETURNING id, name`,
-        [familyName, userId],
-      )
-      const family = created.rows[0]
-      if (!family) throw new Error('family bootstrap did not return a family')
-
-      await client.query(
-        `INSERT INTO family_member (family_id, user_id, role, status, joined_at)
-         VALUES ($1, $2, 'admin', 'active', now())
-         ON CONFLICT (user_id) DO NOTHING`,
-        [family.id, userId],
-      )
-      return {
-        family_id: family.id,
-        family_name: family.name,
-        role: 'admin' as const,
-        status: 'active' as const,
-      }
-    })
+    // The write goes through the SECURITY DEFINER `bootstrap_family` function
+    // (migration 058), not a direct INSERT. Under the request's `authenticated`
+    // RLS context the owner cannot yet see the `family` row they are creating,
+    // so `INSERT ... RETURNING` and `family_member_bootstrap_insert`'s subquery
+    // both come up empty — the function does the privileged write instead.
+    type BootstrapRow = {
+      out_family_id: string
+      out_name: string
+      out_role: 'admin' | 'member'
+      out_status: 'invited' | 'active' | 'disabled'
+    }
+    let row: BootstrapRow | null
+    try {
+      row = await q1<BootstrapRow>(`SELECT * FROM bootstrap_family($1)`, [familyName])
+    } catch (err) {
+      // Surface the Postgres failure code rather than a bare 500 — the common
+      // causes here (missing function, FK to app_user, RLS) each have a
+      // distinct SQLSTATE and none of them are sensitive.
+      const pg = err as { code?: string; message?: string }
+      const detail = pg.code ? `${pg.code}: ${pg.message ?? ''}`.trim() : String(pg.message ?? err)
+      throw new ApiError(500, 'family_bootstrap_failed', `Family bootstrap failed — ${detail}`)
+    }
+    if (!row) throw new ApiError(500, 'family_bootstrap_failed', 'Family bootstrap returned no row')
 
     res.status(201).json({
       family: {
-        familyId: context.family_id,
-        familyName: context.family_name,
-        role: context.role,
-        status: context.status,
+        familyId: row.out_family_id,
+        familyName: row.out_name,
+        role: row.out_role,
+        status: row.out_status,
       },
     })
   }),

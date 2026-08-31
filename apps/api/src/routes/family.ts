@@ -9,6 +9,7 @@ import {
 import { ApiError, asyncHandler, clampInt, notFound, UUID_RE, userCache } from '../http.js'
 import { currentUserId } from '../identity.js'
 import {
+  generateInviteLink,
   invitationExpiry,
   normalizeInvitationEmail,
   requireSupabaseAdmin,
@@ -98,29 +99,20 @@ familyRouter.post(
       `${req.protocol}://${req.get('host') ?? 'localhost'}/auth/invite`
     const supabase = requireSupabaseAdmin()
 
-    // Say WHY the provider refused. The generic "could not be sent" hid the two
-    // failures a fresh project actually hits — Supabase's built-in SMTP is rate
-    // limited (a few messages an hour) and, until a custom SMTP provider is
-    // configured, will only deliver to addresses on the Supabase organisation.
-    // Neither is sensitive, and neither is diagnosable without being told.
-    let invited: Awaited<ReturnType<typeof supabase.auth.admin.inviteUserByEmail>>
-    try {
-      invited = await supabase.auth.admin.inviteUserByEmail(email, {
-        redirectTo,
-        data: { family_id: admin.familyId, family_role: 'member' },
-      })
-    } catch (err) {
-      // A throw here is the transport failing, not the provider refusing —
-      // supabase-js returns AuthApiError in `error` and only re-throws below it.
-      const detail = err instanceof Error ? err.message : String(err)
-      throw new ApiError(502, 'invitation_email_failed', `Invitation provider unreachable — ${detail}`)
-    }
-    if (invited.error || !invited.data.user?.id) {
-      const detail = invited.error?.message ?? 'the provider returned no user'
-      throw new ApiError(502, 'invitation_email_failed', `The invitation email could not be sent — ${detail}`)
-    }
-
-    const invitedUserId = invited.data.user.id
+    // `generateLink` rather than `inviteUserByEmail`: it creates the auth user
+    // exactly the same way but RETURNS the action link instead of asking
+    // Supabase to email it. That takes email delivery out of the system
+    // entirely — no SMTP to configure, no per-hour send cap, and no dependency
+    // on Supabase's built-in mailer, which until a custom SMTP provider is
+    // configured only delivers to addresses on the Supabase organisation and so
+    // could never reach a family member's own inbox. The admin copies the link
+    // and sends it however the family actually talks to each other.
+    const { link, userId: invitedUserId } = await generateInviteLink(supabase, {
+      type: 'invite',
+      email,
+      redirectTo,
+      familyId: admin.familyId,
+    })
     const expiresAt = invitationExpiry()
     const writeInvitation = async () => withTx(async (client) => {
       const member = await client.query<{ family_id: string }>(
@@ -180,6 +172,10 @@ familyRouter.post(
     }
 
     res.status(201).json({
+      // `inviteUrl` is returned ONCE, here, and is never stored or listed —
+      // GET /invitations deliberately does not carry it. It is a credential, so
+      // the admin either uses it now or asks for a fresh one.
+      inviteUrl: link,
       invitation: {
         id: invitation.id,
         email: invitation.email,
@@ -187,6 +183,40 @@ familyRouter.post(
         expiresAt: invitation.expires_at,
       },
     })
+  }),
+)
+
+// Re-mint the link for an invitation that is still pending. The link is shown
+// once and handed over by hand, so losing it before it is pasted is the normal
+// failure — without this the only recovery is revoke-and-re-invite, and a fresh
+// `invite` for an address GoTrue already knows is refused outright. `magiclink`
+// is the type that works for an existing account; it lands on the same
+// `/auth/invite` screen, where the member sets their password.
+familyRouter.post(
+  '/invitations/:invitationId/link',
+  asyncHandler(async (req, res) => {
+    const admin = await requireFamilyAdmin(currentUserId(req))
+    const rawId = req.params.invitationId
+    const invitationId = Array.isArray(rawId) ? rawId[0] : rawId
+    if (!invitationId || !UUID_RE.test(invitationId)) throw notFound('Invitation not found')
+
+    const invitation = await q1<{ email: string }>(
+      `SELECT email FROM family_invitation
+        WHERE id = $1 AND family_id = $2 AND status = 'pending'`,
+      [invitationId, admin.familyId],
+    )
+    if (!invitation) throw notFound('No pending invitation with that id')
+
+    const redirectTo =
+      process.env.FAMILY_INVITE_REDIRECT_URL ??
+      `${req.protocol}://${req.get('host') ?? 'localhost'}/auth/invite`
+    const { link } = await generateInviteLink(requireSupabaseAdmin(), {
+      type: 'magiclink',
+      email: invitation.email,
+      redirectTo,
+      familyId: admin.familyId,
+    })
+    res.json({ inviteUrl: link })
   }),
 )
 

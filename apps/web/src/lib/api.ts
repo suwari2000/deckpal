@@ -1600,8 +1600,13 @@ export const api = {
   },
   familyInvitations: (signal?: AbortSignal) =>
     get<{ invitations: FamilyInvitation[] }>('/family/invitations', signal),
+  // `inviteUrl` is returned once, on creation, and never listed — it is a
+  // credential. The admin copies it and sends it to the member themselves; no
+  // email is sent by DeckPal or by Supabase.
   inviteFamilyMember: (email: string) =>
-    send<{ invitation: FamilyInvitation }>('POST', '/family/invitations', { email }),
+    send<{ inviteUrl: string; invitation: FamilyInvitation }>('POST', '/family/invitations', { email }),
+  regenerateFamilyInviteLink: (id: string) =>
+    send<{ inviteUrl: string }>('POST', `/family/invitations/${encodeURIComponent(id)}/link`),
   revokeFamilyInvitation: (id: string) =>
     send<void>('DELETE', `/family/invitations/${encodeURIComponent(id)}`),
   activateFamilyInvitation: () => send<{ family: FamilyContext }>('POST', '/family/activate'),

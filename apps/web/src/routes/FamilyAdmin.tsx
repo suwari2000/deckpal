@@ -26,9 +26,17 @@ export function FamilyAdmin() {
     await queryClient.invalidateQueries({ queryKey: ['family', 'invitations'] })
     await queryClient.invalidateQueries({ queryKey: ['family', 'ai-usage'] })
   }
+  // The link is shown once, in the panel, for the admin to copy — DeckPal sends
+  // no email and neither does Supabase, so this is the only place it appears.
+  const [inviteUrl, setInviteUrl] = useState<string | null>(null)
+  const [copied, setCopied] = useState(false)
   const invite = useMutation({
     mutationFn: (address: string) => api.inviteFamilyMember(address),
-    onSuccess: async () => { setEmail(''); await refresh() },
+    onSuccess: async (data) => { setEmail(''); setInviteUrl(data.inviteUrl); setCopied(false); await refresh() },
+  })
+  const relink = useMutation({
+    mutationFn: (id: string) => api.regenerateFamilyInviteLink(id),
+    onSuccess: (data) => { setInviteUrl(data.inviteUrl); setCopied(false) },
   })
   const revoke = useMutation({ mutationFn: (id: string) => api.revokeFamilyInvitation(id), onSuccess: refresh })
   const status = useMutation({
@@ -67,17 +75,24 @@ export function FamilyAdmin() {
       <div className="grid gap-[18px] lg:grid-cols-2">
         <Panel>
           <h2 className="text-[20px] font-bold text-text-primary">Jemput ahli</h2>
-          <p className="mt-[5px] text-[14px] text-text-secondary">Akaun hanya boleh dibuat melalui e-mel jemputan admin.</p>
+          <p className="mt-[5px] text-[14px] text-text-secondary">Akaun hanya boleh dibuat melalui pautan jemputan admin. DeckPal tidak menghantar e-mel — salin pautan dan hantar sendiri (WhatsApp, Telegram, apa sahaja).</p>
           <form onSubmit={submit} className="mt-[16px] flex flex-col gap-[10px] sm:flex-row">
             <input value={email} onChange={(e) => setEmail(e.target.value)} type="email" required placeholder="ahli@keluarga.com" className="min-w-0 flex-1 rounded-[12px] border border-border-default bg-surface-primary px-[13px] py-[10px] text-text-primary" />
-            <button disabled={invite.isPending} className={PRIMARY}>{invite.isPending ? 'Menghantar…' : 'Hantar jemputan'}</button>
+            <button disabled={invite.isPending} className={PRIMARY}>{invite.isPending ? 'Menjana…' : 'Jana pautan'}</button>
           </form>
           {invite.error && <ErrorText error={invite.error} />}
+          {relink.error && <ErrorText error={relink.error} />}
+          {inviteUrl && <InviteLink url={inviteUrl} copied={copied} onCopied={setCopied} />}
           <div className="mt-[18px] space-y-[9px]">
             {invites.data?.invitations.map((item) => (
               <div key={item.id} className="flex items-center justify-between gap-[10px] rounded-[12px] border border-border-default p-[11px]">
                 <div className="min-w-0"><p className="truncate font-semibold text-text-primary">{item.email}</p><p className="text-[12px] text-text-muted">{item.status}</p></div>
-                {item.status === 'pending' && <button className={DANGER} onClick={() => revoke.mutate(item.id)}>Batalkan</button>}
+                {item.status === 'pending' && (
+                  <div className="flex shrink-0 gap-[8px]">
+                    <button className={SECONDARY} disabled={relink.isPending} onClick={() => relink.mutate(item.id)}>Pautan baharu</button>
+                    <button className={DANGER} onClick={() => revoke.mutate(item.id)}>Batalkan</button>
+                  </div>
+                )}
               </div>
             ))}
           </div>
@@ -196,6 +211,41 @@ function AiMemberControl(props: {
         <label className="text-[11px] text-text-muted">Bonus<input type="number" min={0} max={1000} value={bonus} onChange={(event) => setBonus(Number(event.target.value))} className="mt-[3px] block w-[72px] rounded-[8px] border border-border-default bg-surface-primary px-[8px] py-[6px] text-text-primary" /></label>
         <button type="button" disabled={props.pending} onClick={() => props.onSave(custom ? limit : null, bonus)} className={SECONDARY}>Simpan</button>
       </div>
+    </div>
+  )
+}
+
+/**
+ * The invitation link, shown once. Whoever holds it becomes that account, so it
+ * is never listed alongside the pending invitations — it appears here, gets
+ * copied, and is gone on the next render of the page.
+ *
+ * The textarea is readOnly rather than disabled so the link stays selectable by
+ * hand: `navigator.clipboard` needs a secure context and a permission that a
+ * browser can refuse, and "the button did nothing" must not be a dead end.
+ */
+function InviteLink({ url, copied, onCopied }: { url: string; copied: boolean; onCopied: (value: boolean) => void }) {
+  return (
+    <div className="mt-[14px] rounded-[12px] border border-border-default bg-surface-primary p-[12px]">
+      <p className="text-[13px] font-bold text-text-primary">Pautan jemputan — hantar kepada ahli</p>
+      <p className="mt-[3px] text-[12px] text-text-muted">Sah selama 7 hari, sekali guna. Ia hanya dipaparkan sekarang; guna “Pautan baharu” jika hilang.</p>
+      <textarea
+        readOnly
+        value={url}
+        rows={3}
+        aria-label="Pautan jemputan"
+        onFocus={(event) => event.currentTarget.select()}
+        className="mt-[9px] w-full resize-none break-all rounded-[8px] border border-border-default bg-surface-raised px-[9px] py-[7px] font-mono text-[12px] text-text-primary"
+      />
+      <button
+        type="button"
+        className={`${SECONDARY} mt-[9px]`}
+        onClick={() => {
+          navigator.clipboard?.writeText(url).then(() => onCopied(true), () => onCopied(false))
+        }}
+      >
+        {copied ? 'Disalin ✓' : 'Salin pautan'}
+      </button>
     </div>
   )
 }

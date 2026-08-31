@@ -97,17 +97,32 @@ familyRouter.post(
       process.env.FAMILY_INVITE_REDIRECT_URL ??
       `${req.protocol}://${req.get('host') ?? 'localhost'}/auth/invite`
     const supabase = requireSupabaseAdmin()
-    const invited = await supabase.auth.admin.inviteUserByEmail(email, {
-      redirectTo,
-      data: { family_id: admin.familyId, family_role: 'member' },
-    })
+
+    // Say WHY the provider refused. The generic "could not be sent" hid the two
+    // failures a fresh project actually hits — Supabase's built-in SMTP is rate
+    // limited (a few messages an hour) and, until a custom SMTP provider is
+    // configured, will only deliver to addresses on the Supabase organisation.
+    // Neither is sensitive, and neither is diagnosable without being told.
+    let invited: Awaited<ReturnType<typeof supabase.auth.admin.inviteUserByEmail>>
+    try {
+      invited = await supabase.auth.admin.inviteUserByEmail(email, {
+        redirectTo,
+        data: { family_id: admin.familyId, family_role: 'member' },
+      })
+    } catch (err) {
+      // A throw here is the transport failing, not the provider refusing —
+      // supabase-js returns AuthApiError in `error` and only re-throws below it.
+      const detail = err instanceof Error ? err.message : String(err)
+      throw new ApiError(502, 'invitation_email_failed', `Invitation provider unreachable — ${detail}`)
+    }
     if (invited.error || !invited.data.user?.id) {
-      throw new ApiError(502, 'invitation_email_failed', 'The invitation email could not be sent')
+      const detail = invited.error?.message ?? 'the provider returned no user'
+      throw new ApiError(502, 'invitation_email_failed', `The invitation email could not be sent — ${detail}`)
     }
 
     const invitedUserId = invited.data.user.id
     const expiresAt = invitationExpiry()
-    const invitation = await withTx(async (client) => {
+    const writeInvitation = async () => withTx(async (client) => {
       const member = await client.query<{ family_id: string }>(
         `INSERT INTO family_member (family_id, user_id, role, status)
          VALUES ($1, $2, 'member', 'invited')
@@ -138,9 +153,31 @@ familyRouter.post(
         [admin.familyId, invitedUserId, email, userId, expiresAt.toISOString()],
       )
       const row = created.rows[0]
-      if (!row) throw new Error('invitation insert returned no row')
+      if (!row) {
+        // RLS hides a row it just let you write when no SELECT policy matches —
+        // the same shape of failure as the family bootstrap (migration 058).
+        throw new ApiError(
+          500,
+          'invitation_write_failed',
+          'The invitation row was written but could not be read back (RLS SELECT policy)',
+        )
+      }
       return row
     })
+
+    let invitation: Awaited<ReturnType<typeof writeInvitation>>
+    try {
+      invitation = await writeInvitation()
+    } catch (err) {
+      if (err instanceof ApiError) throw err
+      // Surface the SQLSTATE. The plausible causes each have a distinct,
+      // non-sensitive code: 23503 (the invited account has no app_user row —
+      // the handle_new_user signup trigger from migration 021 is missing),
+      // 42501 (RLS refused the INSERT), 23505 (duplicate pending invitation).
+      const pg = err as { code?: string; message?: string }
+      const detail = pg.code ? `${pg.code}: ${pg.message ?? ''}`.trim() : String(pg.message ?? err)
+      throw new ApiError(500, 'invitation_write_failed', `Invitation could not be recorded — ${detail}`)
+    }
 
     res.status(201).json({
       invitation: {

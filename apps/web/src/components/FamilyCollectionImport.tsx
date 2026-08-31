@@ -13,6 +13,7 @@ export function FamilyCollectionImport() {
     mutationFn: () => api.previewFamilyCollectionImport(text),
     onSuccess: (result) => { setPreview(result); setAcknowledged(false); setApplied(null) },
   })
+  const [progress, setProgress] = useState<{ done: number; total: number } | null>(null)
   const commit = useMutation({
     mutationFn: async () => {
       if (!preview) throw new Error('Preview is required')
@@ -22,16 +23,50 @@ export function FamilyCollectionImport() {
         const current = byVariant.get(item.variantId)
         byVariant.set(item.variantId, { quantity: (current?.quantity ?? 0) + item.quantity, condition })
       }
-      return api.collectionBatch(
-        [...byVariant].map(([variantId, item]) => ({ variantId, quantity: item.quantity, condition: item.condition })),
-        { source: 'web', note: 'Import koleksi DeckPal ke akaun admin', idempotencyKey: `family-import:${preview.fingerprint}` },
-      )
+      const rows = [...byVariant].map(([variantId, item]) => ({
+        variantId,
+        quantity: item.quantity,
+        condition: item.condition,
+      }))
+
+      // The parser accepts 5,000 rows but `POST /collection/batch` refuses more
+      // than 250 (BATCH_MAX_ITEMS, a ceiling on the API's own 30 s RLS hold), so
+      // a real collection previewed clean and then failed on commit with
+      // "items must be 250 or fewer". Send it in chunks instead of asking the
+      // reader to split the file by hand.
+      //
+      // Sequential, not parallel: each batch recomputes set progress, and the
+      // pool is small. `preview.matched` is ordered by cardId, so a chunk spans
+      // only a few sets and stays clear of BATCH_MAX_SETS (40) as well.
+      //
+      // The idempotency key carries the chunk index. Without it every chunk
+      // after the first would collide with the first one's key and be answered
+      // from that batch's stored response — reporting success while writing
+      // nothing (migration 036).
+      const CHUNK = 200
+      const chunks: typeof rows[] = []
+      for (let index = 0; index < rows.length; index += CHUNK) chunks.push(rows.slice(index, index + CHUNK))
+
+      setProgress({ done: 0, total: chunks.length })
+      let applied = 0
+      for (const [index, chunk] of chunks.entries()) {
+        const result = await api.collectionBatch(chunk, {
+          source: 'web',
+          note: 'Import koleksi DeckPal ke akaun admin',
+          idempotencyKey: `family-import:${preview.fingerprint}:${index}`,
+        })
+        applied += result.applied
+        setProgress({ done: index + 1, total: chunks.length })
+      }
+      return { applied }
     },
     onSuccess: async (result) => {
       setApplied(result.applied)
+      setProgress(null)
       await queryClient.invalidateQueries({ queryKey: ['family', 'members'] })
       await queryClient.invalidateQueries({ queryKey: ['family'] })
     },
+    onError: () => setProgress(null),
   })
   const hasWarnings = !!preview && (preview.ambiguous.length > 0 || preview.unresolved.length > 0 || preview.errors.length > 0)
 
@@ -51,7 +86,7 @@ export function FamilyCollectionImport() {
             }} />
           </label>
           <button type="button" disabled={!text.trim() || check.isPending} onClick={() => check.mutate()} className={PRIMARY}>{check.isPending ? 'Memeriksa…' : 'Preview import'}</button>
-          {preview && <button type="button" disabled={commit.isPending || preview.matched.length === 0 || (hasWarnings && !acknowledged)} onClick={() => commit.mutate()} className={PRIMARY}>{commit.isPending ? 'Mengimport…' : `Import ${preview.matched.length} baris`}</button>}
+          {preview && <button type="button" disabled={commit.isPending || preview.matched.length === 0 || (hasWarnings && !acknowledged)} onClick={() => commit.mutate()} className={PRIMARY}>{commit.isPending ? (progress && progress.total > 1 ? `Mengimport… ${progress.done}/${progress.total}` : 'Mengimport…') : `Import ${preview.matched.length} baris`}</button>}
         </div>
       </div>
       {preview && (
